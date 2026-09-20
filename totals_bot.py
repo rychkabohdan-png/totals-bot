@@ -2,22 +2,29 @@
 #  TOTALS BOT — Telegram-бот для пошуку матчів з високою ймовірністю
 #  тоталу голів (ТБ 1.5 / ТБ 2.5)
 #
-#  Джерело даних: "Free API Live Football Data" (RapidAPI, автор Smart API)
-#  Безкоштовний план: обмежена к-сть запитів/день — скрипт сам стежить
-#  за лічильником і зупиняється, щоб не перевищити ліміт.
+#  Джерело даних: API-FOOTBALL (офіційно, напряму через api-football.com,
+#  БЕЗ RapidAPI). Безкоштовний план: 100 запитів/день, ліміт скидається
+#  о 00:00 UTC. Скрипт сам стежить за лічильником, щоб не перевищити його.
 # =====================================================================
 #
-#  Що робить бот:
-#   1) Раз на CHECK_PREMATCH_EVERY_HOURS годин бере сьогоднішні матчі,
-#      які ще не почались. Для кожної унікальної ліги один раз завантажує
-#      турнірну таблицю (де вже є "голів забито - голів пропущено" за
-#      сезон) і рахує середній тотал голів команди: (забито+пропущено)/
-#      зіграно. Якщо в обох команд матчу середній тотал > порогу —
-#      надсилає сповіщення (пре-матч сигнал).
-#   2) Кожні CHECK_LIVE_EVERY_MINUTES хвилин перевіряє LIVE-матчі: якщо
-#      хвилина 25–35, рахунок 0:0, а сумарна к-сть ударів (shots) висока
-#      — надсилає сповіщення (live-сигнал).
+#  ВАЖЛИВО ПРО ЛІМІТ: 100 запитів/день — це небагато, тому:
+#   - Live-матчі перевіряються НЕ надто часто (за замовчуванням раз на
+#     30 хвилин), щоб залишити запас на все інше.
+#   - Статистика конкретного матчу (удари в створ тощо) запитується
+#     ЛИШЕ для матчів, які вже підходять за хвилиною і рахунком —
+#     тобто це рідкісні, "точкові" запити, а не масові.
+#   - Пре-матч аналіз запускається раз на день і кешує вже перевірені
+#     команди, щоб не питати статистику однієї й тієї ж команди двічі.
 #
+#  Стратегія (сильні сигнали — тобто зменшена кількість, але надійніші):
+#   1) ПРЕ-МАТЧ: команда вважається "результативною", якщо середня
+#      кількість голів за матч (забито+пропущено) > AVG_GOALS_THRESHOLD.
+#      Сигнал надсилається, тільки якщо ОБИДВІ команди матчу відповідають
+#      цій умові, І сума їх середніх ≥ COMBINED_AVG_GOALS_THRESHOLD.
+#   2) LIVE: рахунок 0:0, хвилина в діапазоні LIVE_MINUTE_FROM..TO.
+#      Дивимось на удари в створ і загальну кількість ударів та кутові —
+#      сигнал надсилається, тільки якщо мінімум LIVE_MIN_CRITERIA_MATCHED
+#      з 3 умов виконались одночасно.
 # =====================================================================
 
 import requests
@@ -30,44 +37,46 @@ from datetime import datetime, date
 #  1. НАЛАШТУВАННЯ
 # =====================================================================
 
-TELEGRAM_BOT_TOKEN = "8987703737:AAFB1b_t5SJy-ChhliZACjRi3dCbTguEfPA"
+TELEGRAM_BOT_TOKEN = "8972182844:AAHevRhJ9TQP3Ujw-nzoJ1wINqBK0QFcdZI"
 TELEGRAM_CHAT_ID = "6028507442"
 
-# Ключ RapidAPI для "Free API Live Football Data"
-RAPIDAPI_KEY = "a00a1680d9msh3298193c9e76b9ap166841jsn8848ae9991c0"
+# Ключ з api-football.com (Account -> My Access)
+APIFOOTBALL_KEY = "b45a7e58d179e26b5da36615e79a8559"
 
 # =====================================================================
-#  2. ПАРАМЕТРИ СТРАТЕГІЇ (можна змінювати під себе)
+#  2. ПАРАМЕТРИ СТРАТЕГІЇ
 # =====================================================================
 
-AVG_GOALS_THRESHOLD = 2.5      # поріг середньої к-сті голів для пре-матч сигналу
-MIN_PLAYED_FOR_PREMATCH = 3    # мінімум зіграних матчів у команди, щоб довіряти статистиці
+AVG_GOALS_THRESHOLD = 2.5           # поріг середньої к-сті голів КОЖНОЇ з команд
+COMBINED_AVG_GOALS_THRESHOLD = 6.0  # І сума середніх обох команд має бути не нижче цього
+MIN_FIXTURES_FOR_PREMATCH = 5       # мінімум зіграних матчів команди в сезоні, щоб довіряти статистиці
 
-LIVE_MINUTE_FROM = 25          # від якої хвилини шукати live-сигнал
-LIVE_MINUTE_TO = 35            # до якої хвилини
-LIVE_TOTAL_SHOTS_THRESHOLD = 10   # сумарна к-сть ударів (обидві команди), що вважається "багато"
+LIVE_MINUTE_FROM = 20
+LIVE_MINUTE_TO = 40
 
-CHECK_LIVE_EVERY_MINUTES = 20     # як часто перевіряти live-матчі
-CHECK_PREMATCH_EVERY_HOURS = 12   # як часто оновлювати пре-матч аналіз
+LIVE_SHOTS_ON_TARGET_THRESHOLD = 5   # сумарно ударів у створ ворін
+LIVE_TOTAL_SHOTS_THRESHOLD = 14      # сумарно всіх ударів (вищий поріг, бо менш якісний показник)
+LIVE_CORNERS_THRESHOLD = 8           # сумарно кутових ударів
+LIVE_MIN_CRITERIA_MATCHED = 2        # скільки з 3 умов має спрацювати одночасно
 
-MAX_REQUESTS_PER_DAY = 95         # запобіжник проти денного ліміту
-MAX_LEAGUES_PER_PREMATCH_RUN = 15 # скільки різних ліг максимум перевіряти за один прогін
+CHECK_LIVE_EVERY_MINUTES = 30        # частота перевірки live-матчів (бережемо ліміт запитів)
+CHECK_PREMATCH_ONCE_PER_DAY = True   # пре-матч аналіз — 1 раз на день
+
+MAX_REQUESTS_PER_DAY = 90            # запобіжник (справжній ліміт 100, лишаємо запас)
+MAX_TEAM_STATS_LOOKUPS_PER_DAY = 40  # скільки запитів на статистику команд максимум за день
+MAX_FIXTURES_TO_SCAN_PREMATCH = 20   # скільки сьогоднішніх матчів максимум розглядати
 
 # =====================================================================
 #  3. ТЕХНІЧНІ РЕЧІ
 # =====================================================================
 
-API_HOST = "free-api-live-football-data.p.rapidapi.com"
-API_BASE = f"https://{API_HOST}"
-HEADERS = {
-    "x-rapidapi-key": RAPIDAPI_KEY,
-    "x-rapidapi-host": API_HOST,
-}
+API_BASE = "https://v3.football.api-sports.io"
+HEADERS = {"x-apisports-key": APIFOOTBALL_KEY}
 
 STATE_FILE = "bot_state.json"
 
 # ---------------------------------------------------------------------
-#  Стан бота (щоб не дублювати сповіщення і не перевищувати ліміт)
+#  Стан бота
 # ---------------------------------------------------------------------
 
 def load_state():
@@ -80,8 +89,12 @@ def load_state():
     return {
         "date": str(date.today()),
         "requests_used": 0,
+        "team_stats_lookups_used": 0,
         "notified_prematch_ids": [],
         "notified_live_ids": [],
+        "prematch_done_today": False,
+        # кеш середніх голів команди за сезон: "team_id:league_id:season" -> avg_goals
+        "team_avg_cache": {},
     }
 
 def save_state(state):
@@ -91,15 +104,18 @@ def save_state(state):
 def reset_state_if_new_day(state):
     today = str(date.today())
     if state.get("date") != today:
-        print(f"[INFO] Новий день ({today}) — скидаю лічильник запитів і список сповіщень.")
+        print(f"[INFO] Новий день ({today}) — скидаю лічильники і кеш.")
         state["date"] = today
         state["requests_used"] = 0
+        state["team_stats_lookups_used"] = 0
         state["notified_prematch_ids"] = []
         state["notified_live_ids"] = []
+        state["prematch_done_today"] = False
+        state["team_avg_cache"] = {}
     return state
 
 # ---------------------------------------------------------------------
-#  Запити до API з лічильником
+#  Запити до API-FOOTBALL з лічильником
 # ---------------------------------------------------------------------
 
 def api_get(state, endpoint, params=None):
@@ -110,12 +126,19 @@ def api_get(state, endpoint, params=None):
         resp = requests.get(f"{API_BASE}{endpoint}", headers=HEADERS, params=params, timeout=15)
         state["requests_used"] += 1
         save_state(state)
+
+        if resp.status_code == 429:
+            print("[WARN] API-FOOTBALL: 429 — ліміт запитів вичерпано на сьогодні.")
+            state["requests_used"] = MAX_REQUESTS_PER_DAY  # більше не пробуємо сьогодні
+            save_state(state)
+            return None
         if resp.status_code != 200:
             print(f"[ERROR] API повернув статус {resp.status_code}: {resp.text[:200]}")
             return None
+
         data = resp.json()
-        if data.get("status") != "success":
-            print(f"[WARN] API відповів без success: {str(data)[:200]}")
+        if data.get("errors"):
+            print(f"[WARN] API-FOOTBALL повернув помилку: {data['errors']}")
             return None
         return data.get("response")
     except Exception as e:
@@ -133,163 +156,142 @@ def send_telegram_message(text):
         r = requests.post(url, data=payload, timeout=15)
         if r.status_code != 200:
             print(f"[ERROR] Telegram не прийняв повідомлення: {r.text[:200]}")
+            return False
+        return True
     except Exception as e:
         print(f"[ERROR] Не вдалося надіслати повідомлення в Telegram: {e}")
+        return False
 
 # ---------------------------------------------------------------------
-#  ЛОГІКА 1: Пре-матч аналіз через турнірну таблицю ліги
+#  ЛОГІКА 1: Пре-матч аналіз
 # ---------------------------------------------------------------------
 
-def get_matches_by_date(state, yyyymmdd):
-    resp = api_get(state, "/football-get-matches-by-date", params={"date": yyyymmdd})
+def guess_season_for_date(d):
+    """Європейський сезон зазвичай позначається роком його старту (напр. 2026 для сезону 2026/27)."""
+    return d.year if d.month >= 7 else d.year - 1
+
+def get_team_avg_goals(state, team_id, league_id, season):
+    """Повертає середню к-сть голів (забито+пропущено) команди за сезон, з кешем на день."""
+    cache_key = f"{team_id}:{league_id}:{season}"
+    if cache_key in state["team_avg_cache"]:
+        return state["team_avg_cache"][cache_key]
+
+    if state["team_stats_lookups_used"] >= MAX_TEAM_STATS_LOOKUPS_PER_DAY:
+        return None
+
+    resp = api_get(state, "/teams/statistics", params={
+        "team": team_id, "league": league_id, "season": season
+    })
+    state["team_stats_lookups_used"] += 1
+    save_state(state)
+
     if not resp:
-        return []
-    return resp.get("matches", [])
+        return None
 
-def get_league_table(state, league_id):
-    """Повертає {team_id: {"name":..., "avg_goals":..., "played":...}, ...} для ліги."""
-    resp = api_get(state, "/football-get-list-all-team", params={"leagueid": league_id})
-    if not resp:
-        return {}
+    goals = resp.get("goals", {})
+    try:
+        avg_for = float(goals.get("for", {}).get("average", {}).get("total", 0) or 0)
+        avg_against = float(goals.get("against", {}).get("average", {}).get("total", 0) or 0)
+        played = resp.get("fixtures", {}).get("played", {}).get("total", 0) or 0
+    except (ValueError, TypeError):
+        return None
 
-    table = {}
-    for team in resp.get("list", []):
-        played = team.get("played") or 0
-        scores_str = team.get("scoresStr")  # напр. "10-1" (забито-пропущено)
-        if not played or not scores_str or "-" not in scores_str:
-            continue
-        try:
-            scored_str, conceded_str = scores_str.split("-")
-            scored = int(scored_str.strip())
-            conceded = int(conceded_str.strip())
-        except ValueError:
-            continue
+    if played < MIN_FIXTURES_FOR_PREMATCH:
+        return None
 
-        if played < MIN_PLAYED_FOR_PREMATCH:
-            continue
-
-        avg_goals = (scored + conceded) / played
-        table[team.get("id")] = {
-            "name": team.get("name"),
-            "avg_goals": avg_goals,
-            "played": played,
-        }
-    return table
+    avg_total = avg_for + avg_against
+    state["team_avg_cache"][cache_key] = avg_total
+    save_state(state)
+    return avg_total
 
 def check_prematch_signals(state):
     print("[INFO] Запускаю пре-матч аналіз сьогоднішніх матчів...")
-    today_str = date.today().strftime("%Y%m%d")
-    matches = get_matches_by_date(state, today_str)
+    today_str = date.today().strftime("%Y-%m-%d")
+    matches = api_get(state, "/fixtures", params={"date": today_str})
     if not matches:
         print("[WARN] Не вдалося отримати сьогоднішні матчі.")
         return
 
-    # Залишаємо тільки матчі, які ще не почались і не скасовані
-    upcoming = []
-    for m in matches:
-        status = m.get("status", {})
-        if status.get("started") is False and status.get("cancelled") is False:
-            upcoming.append(m)
+    upcoming = [m for m in matches if m.get("fixture", {}).get("status", {}).get("short") == "NS"]
+    upcoming = upcoming[:MAX_FIXTURES_TO_SCAN_PREMATCH]
+    print(f"[INFO] Знайдено {len(upcoming)} матчів для пре-матч перевірки (з {len(matches)} всього).")
 
-    print(f"[INFO] Знайдено {len(upcoming)} матчів, що ще не почались (з {len(matches)} всього).")
-
-    # Групуємо за лігою, щоб один запит покривав усі матчі цієї ліги
-    leagues_needed = {}
     for m in upcoming:
-        leagues_needed.setdefault(m.get("leagueId"), []).append(m)
-
-    league_ids = list(leagues_needed.keys())[:MAX_LEAGUES_PER_PREMATCH_RUN]
-
-    for league_id in league_ids:
-        table = get_league_table(state, league_id)
-        if not table:
+        fixture_id = m["fixture"]["id"]
+        if fixture_id in state["notified_prematch_ids"]:
             continue
 
-        for m in leagues_needed[league_id]:
-            fixture_id = m.get("id")
-            if fixture_id in state["notified_prematch_ids"]:
-                continue
+        league = m.get("league", {})
+        league_id = league.get("id")
+        season = league.get("season")
+        home = m["teams"]["home"]
+        away = m["teams"]["away"]
 
-            home = m.get("home", {})
-            away = m.get("away", {})
-            home_stats = table.get(home.get("id"))
-            away_stats = table.get(away.get("id"))
+        if not league_id or not season:
+            continue
 
-            if not home_stats or not away_stats:
-                continue
+        home_avg = get_team_avg_goals(state, home["id"], league_id, season)
+        away_avg = get_team_avg_goals(state, away["id"], league_id, season)
 
-            if home_stats["avg_goals"] > AVG_GOALS_THRESHOLD and away_stats["avg_goals"] > AVG_GOALS_THRESHOLD:
-                text = (
-                    f"⚽️ <b>Пре-матч сигнал (тотал голів)</b>\n\n"
-                    f"🆚 {home.get('name')} — {away.get('name')}\n"
-                    f"🕒 Початок: {m.get('time')}\n\n"
-                    f"📊 Середній тотал за сезон:\n"
-                    f"   {home.get('name')}: {home_stats['avg_goals']:.2f} ({home_stats['played']} матчів)\n"
-                    f"   {away.get('name')}: {away_stats['avg_goals']:.2f} ({away_stats['played']} матчів)\n\n"
-                    f"✅ Рекомендація: Ставка ТБ 2.5"
-                )
-                send_telegram_message(text)
+        if home_avg is None or away_avg is None:
+            continue
+
+        both_above = home_avg > AVG_GOALS_THRESHOLD and away_avg > AVG_GOALS_THRESHOLD
+        combined = home_avg + away_avg
+        combined_above = combined >= COMBINED_AVG_GOALS_THRESHOLD
+
+        if both_above and combined_above:
+            text = (
+                f"⚽️ <b>Пре-матч сигнал (тотал голів)</b>\n\n"
+                f"🏆 {league.get('name')}\n"
+                f"🆚 {home['name']} — {away['name']}\n"
+                f"🕒 Початок: {m['fixture']['date']}\n\n"
+                f"📊 Середній тотал за сезон:\n"
+                f"   {home['name']}: {home_avg:.2f}\n"
+                f"   {away['name']}: {away_avg:.2f}\n"
+                f"   Сума середніх: {combined:.2f} (поріг {COMBINED_AVG_GOALS_THRESHOLD})\n\n"
+                f"✅ Рекомендація: Ставка ТБ 2.5"
+            )
+            if send_telegram_message(text):
                 state["notified_prematch_ids"].append(fixture_id)
                 save_state(state)
-                print(f"[INFO] Надіслано пре-матч сигнал: {home.get('name')} — {away.get('name')}")
+                print(f"[INFO] Надіслано пре-матч сигнал: {home['name']} — {away['name']}")
 
 # ---------------------------------------------------------------------
-#  ЛОГІКА 2: Live-аналіз (0:0 на 25–35 хв. і багато ударів)
+#  ЛОГІКА 2: Live-аналіз
 # ---------------------------------------------------------------------
 
 def get_live_matches(state):
-    resp = api_get(state, "/football-current-live")
-    if not resp:
-        return []
-    return resp.get("live", [])
+    resp = api_get(state, "/fixtures", params={"live": "all"})
+    return resp or []
 
-def parse_minute(live_time_short):
-    """Перетворює "25'" або "45+2'" на ціле число хвилин, або None."""
-    if not live_time_short:
-        return None
-    text = live_time_short.replace("'", "").strip()
-    if "+" in text:
-        text = text.split("+")[0]
-    try:
-        return int(text)
-    except ValueError:
-        return None
-
-def get_fixture_total_shots(state, event_id):
-    """Шукає показник 'Total shots' у статистиці матчу, повертає (home_shots, away_shots) або None."""
-    resp = api_get(state, "/football-get-match-event-all-stats", params={"eventid": event_id})
-    if not resp:
-        return None
-
-    for category in resp.get("stats", []):
-        for stat in category.get("stats", []):
-            if stat.get("key") == "total_shots" and stat.get("title") == "Total shots":
-                values = stat.get("stats", [])
-                if len(values) == 2 and values[0] is not None and values[1] is not None:
-                    try:
-                        return int(values[0]), int(values[1])
-                    except (ValueError, TypeError):
-                        return None
-    return None
+def extract_stat(stats_response, stat_type):
+    """stats_response — це response з /fixtures/statistics (список по 2 команди)."""
+    values = []
+    for team_block in stats_response:
+        for stat in team_block.get("statistics", []):
+            if stat.get("type") == stat_type:
+                v = stat.get("value")
+                try:
+                    values.append(int(v) if v is not None else 0)
+                except (ValueError, TypeError):
+                    values.append(0)
+    return values if len(values) == 2 else None
 
 def check_live_signals(state):
     print("[INFO] Перевіряю live-матчі...")
     live_matches = get_live_matches(state)
     print(f"[INFO] Зараз {len(live_matches)} live-матчів.")
 
-    for match in live_matches:
-        fixture_id = match.get("id")
+    for m in live_matches:
+        fixture_id = m["fixture"]["id"]
         if fixture_id in state["notified_live_ids"]:
             continue
 
-        home = match.get("home", {})
-        away = match.get("away", {})
-        home_score = home.get("score")
-        away_score = away.get("score")
-
-        status = match.get("status", {})
-        live_time = status.get("liveTime", {})
-        minute = parse_minute(live_time.get("short"))
+        minute = m["fixture"]["status"].get("elapsed")
+        goals = m.get("goals", {})
+        home_score = goals.get("home")
+        away_score = goals.get("away")
 
         if minute is None or home_score is None or away_score is None:
             continue
@@ -298,25 +300,51 @@ def check_live_signals(state):
         if not (home_score == 0 and away_score == 0):
             continue
 
-        shots = get_fixture_total_shots(state, fixture_id)
-        if not shots:
-            continue
-        total_shots = shots[0] + shots[1]
-        if total_shots < LIVE_TOTAL_SHOTS_THRESHOLD:
+        stats_resp = api_get(state, "/fixtures/statistics", params={"fixture": fixture_id})
+        if not stats_resp:
             continue
 
+        sot = extract_stat(stats_resp, "Shots on Goal")
+        total_shots = extract_stat(stats_resp, "Total Shots")
+        corners = extract_stat(stats_resp, "Corner Kicks")
+
+        triggered = []
+        if sot and sum(sot) >= LIVE_SHOTS_ON_TARGET_THRESHOLD:
+            triggered.append(f"удари в створ {sum(sot)} ≥ {LIVE_SHOTS_ON_TARGET_THRESHOLD}")
+        if total_shots and sum(total_shots) >= LIVE_TOTAL_SHOTS_THRESHOLD:
+            triggered.append(f"всього ударів {sum(total_shots)} ≥ {LIVE_TOTAL_SHOTS_THRESHOLD}")
+        if corners and sum(corners) >= LIVE_CORNERS_THRESHOLD:
+            triggered.append(f"кутових {sum(corners)} ≥ {LIVE_CORNERS_THRESHOLD}")
+
+        if len(triggered) < LIVE_MIN_CRITERIA_MATCHED:
+            continue
+
+        home = m["teams"]["home"]["name"]
+        away = m["teams"]["away"]["name"]
+        league_name = m.get("league", {}).get("name", "")
+
+        stats_lines = []
+        if sot:
+            stats_lines.append(f"   Удари в створ: {sot[0]}:{sot[1]}")
+        if total_shots:
+            stats_lines.append(f"   Всього ударів: {total_shots[0]}:{total_shots[1]}")
+        if corners:
+            stats_lines.append(f"   Кутові: {corners[0]}:{corners[1]}")
+
         text = (
-            f"🔴 <b>LIVE сигнал (тотал голів)</b>\n\n"
-            f"🆚 {home.get('name')} — {away.get('name')}\n"
+            f"🔴 <b>СИЛЬНИЙ LIVE сигнал (тотал голів)</b>\n\n"
+            f"🏆 {league_name}\n"
+            f"🆚 {home} — {away}\n"
             f"⏱ Хвилина: {minute}'\n"
             f"⚽️ Рахунок: {home_score}:{away_score}\n\n"
-            f"📊 Сумарна к-сть ударів: {total_shots} ({shots[0]}:{shots[1]})\n\n"
-            f"✅ Рекомендація: Ставка ТБ 1.5 або ТБ 0.5 (найближчі 15-20 хв)"
+            f"📊 Статистика:\n" + "\n".join(stats_lines) + "\n\n"
+            f"✅ Виконано {len(triggered)}/3 критеріїв: {', '.join(triggered)}\n"
+            f"✅ Рекомендація: Ставка ТБ 1.5 або ТБ 0.5"
         )
-        send_telegram_message(text)
-        state["notified_live_ids"].append(fixture_id)
-        save_state(state)
-        print(f"[INFO] Надіслано live-сигнал: {home.get('name')} — {away.get('name')}")
+        if send_telegram_message(text):
+            state["notified_live_ids"].append(fixture_id)
+            save_state(state)
+            print(f"[INFO] Надіслано live-сигнал: {home} — {away}")
 
 # ---------------------------------------------------------------------
 #  ГОЛОВНИЙ ЦИКЛ
@@ -330,19 +358,19 @@ def main():
     state = reset_state_if_new_day(state)
     save_state(state)
 
-    last_prematch_run = None
-
     while True:
         try:
             state = reset_state_if_new_day(state)
-            now = datetime.now()
 
-            if (last_prematch_run is None or
-                    (now - last_prematch_run).total_seconds() >= CHECK_PREMATCH_EVERY_HOURS * 3600):
+            if not state["prematch_done_today"] and CHECK_PREMATCH_ONCE_PER_DAY:
                 check_prematch_signals(state)
-                last_prematch_run = now
+                state["prematch_done_today"] = True
+                save_state(state)
 
-            check_live_signals(state)
+            if state["requests_used"] < MAX_REQUESTS_PER_DAY:
+                check_live_signals(state)
+            else:
+                print("[INFO] Ліміт запитів на сьогодні вичерпано — чекаю до завтра.")
 
         except Exception as e:
             print(f"[ERROR] Несподівана помилка в головному циклі: {e}")
@@ -352,9 +380,4 @@ def main():
         time.sleep(CHECK_LIVE_EVERY_MINUTES * 60)
 
 if __name__ == "__main__":
-    # Якщо ви на Replit — розкоментуйте ці 2 рядки, щоб бот не "засинав".
-    # Для Render.com це НЕ потрібно.
-    # from keep_alive import keep_alive
-    # keep_alive()
-
     main()
